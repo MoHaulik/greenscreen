@@ -8,10 +8,12 @@
     body { font-family: sans-serif; text-align:center; margin:20px }
     #outputCanvas { margin-top:20px; width:80%; max-width:640px; background:#000 }
     #controls button { margin:0 5px }
+    #status { margin:10px; color:#666 }
   </style>
 </head>
 <body>
   <h1>Video Background Remover → MP4</h1>
+  <div id="status">Loading AI model...</div>
   <input type="file" id="videoInput" accept="video/*" />
   <video id="inputVideo" style="display:none" muted playsinline></video>
   <canvas id="outputCanvas"></canvas>
@@ -20,70 +22,92 @@
     <button id="stopRec" disabled>Stop & Convert to MP4</button>
   </div>
 
-  <!-- TF.js & BodyPix -->
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.8.0/dist/tf.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/body-pix@2.2.0/dist/body-pix.min.js"></script>
-  <!-- ffmpeg.wasm -->
   <script type="module">
     import { createFFmpeg, fetchFile } from 'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.6/dist/esm/index.js';
 
-    // --- Set up BodyPix for segmentation ---
-    const netPromise = bodyPix.load({
-      architecture: 'MobileNetV1',
-      outputStride: 16,
-      multiplier: 0.75,
-      quantBytes: 2
-    });
+    const videoInput = document.getElementById('videoInput');
+    const inputVideo = document.getElementById('inputVideo');
+    const canvas = document.getElementById('outputCanvas');
+    const ctx = canvas.getContext('2d');
+    const startRecBtn = document.getElementById('startRec');
+    const stopRecBtn = document.getElementById('stopRec');
+    const status = document.getElementById('status');
 
-    // --- Set up ffmpeg.wasm ---
     const ffmpeg = createFFmpeg({ log: true });
+    let bodyPixNet, recorder, recordedChunks, isProcessing = false;
 
-    // --- DOM refs ---
-    const videoInput   = document.getElementById('videoInput');
-    const inputVideo   = document.getElementById('inputVideo');
-    const canvas       = document.getElementById('outputCanvas');
-    const ctx          = canvas.getContext('2d');
-    const startRecBtn  = document.getElementById('startRec');
-    const stopRecBtn   = document.getElementById('stopRec');
-
-    let recorder, recordedChunks;
-
-    // 1) Load BodyPix
-    let bodyPixNet;
-    netPromise.then(net => bodyPixNet = net);
-
-    // 2) When user picks file, set up video + canvas
-    videoInput.addEventListener('change', e => {
-      const file = e.target.files[0];
-      if (!file) return;
-      inputVideo.src = URL.createObjectURL(file);
-      inputVideo.load();
-      inputVideo.onloadeddata = () => {
-        canvas.width  = inputVideo.videoWidth;
-        canvas.height = inputVideo.videoHeight;
-        startSegmentationLoop();
-        startRecBtn.disabled = false;
-      };
-    });
-
-    // 3) Segmentation loop (same as before)
-    function startSegmentationLoop() {
-      inputVideo.play();
-      (async function frame() {
-        const seg = await bodyPixNet.segmentPerson(inputVideo, {
-          internalResolution: 'medium',
-          segmentationThreshold: 0.7
+    // Load BodyPix model
+    async function loadModel() {
+      try {
+        bodyPixNet = await bodyPix.load({
+          architecture: 'MobileNetV1',
+          outputStride: 16,
+          multiplier: 0.75,
+          quantBytes: 2
         });
-        const mask = bodyPix.toMask(seg);
-        ctx.putImageData(mask, 0, 0);
-        ctx.globalCompositeOperation = 'source-in';
-        ctx.drawImage(inputVideo, 0, 0, canvas.width, canvas.height);
-        ctx.globalCompositeOperation = 'source-over';
-        requestAnimationFrame(frame);
-      })();
+        status.textContent = 'AI model loaded! Select a video file.';
+        videoInput.disabled = false;
+      } catch (err) {
+        status.textContent = 'Error loading model: ' + err.message;
+      }
     }
 
-    // 4) Recording setup
+    // Wait for video metadata and model to be ready
+    videoInput.addEventListener('change', async (e) => {
+      const file = e.target.files[0];
+      if (!file || !bodyPixNet) return;
+      
+      status.textContent = 'Loading video...';
+      inputVideo.src = URL.createObjectURL(file);
+      
+      // Wait for video metadata
+      await new Promise((resolve, reject) => {
+        inputVideo.onloadedmetadata = resolve;
+        inputVideo.onerror = reject;
+        inputVideo.load();
+      });
+
+      canvas.width = inputVideo.videoWidth;
+      canvas.height = inputVideo.videoHeight;
+      
+      startSegmentationLoop();
+      startRecBtn.disabled = false;
+      status.textContent = 'Ready to record!';
+    });
+
+    async function startSegmentationLoop() {
+      try {
+        await inputVideo.play();
+      } catch (err) {
+        status.textContent = 'Video playback failed: ' + err.message;
+        return;
+      }
+
+      async function frame() {
+        if (isProcessing) return;
+        
+        try {
+          const seg = await bodyPixNet.segmentPerson(inputVideo, {
+            internalResolution: 'medium',
+            segmentationThreshold: 0.5  // Lowered from 0.7
+          });
+          
+          const mask = bodyPix.toMask(seg);
+          ctx.putImageData(mask, 0, 0);
+          ctx.globalCompositeOperation = 'source-in';
+          ctx.drawImage(inputVideo, 0, 0, canvas.width, canvas.height);
+          ctx.globalCompositeOperation = 'source-over';
+        } catch (err) {
+          console.error('Segmentation error:', err);
+        }
+        
+        requestAnimationFrame(frame);
+      }
+      frame();
+    }
+
     startRecBtn.addEventListener('click', () => {
       recordedChunks = [];
       const stream = canvas.captureStream(30);
@@ -93,27 +117,27 @@
       };
       recorder.start();
       startRecBtn.disabled = true;
-      stopRecBtn.disabled  = false;
+      stopRecBtn.disabled = false;
+      status.textContent = 'Recording...';
     });
 
-    // 5) On stop: convert WebM → MP4
     stopRecBtn.addEventListener('click', async () => {
       recorder.stop();
       stopRecBtn.disabled = true;
+      isProcessing = true;
+      status.textContent = 'Processing video...';
 
-      // wait for final chunk
       await new Promise(res => recorder.onstop = res);
       const webmBlob = new Blob(recordedChunks, { type: 'video/webm' });
 
-      // Load ffmpeg if not already
       if (!ffmpeg.isLoaded()) {
+        status.textContent = 'Loading video converter...';
         await ffmpeg.load();
       }
 
-      // Write WebM into FFmpeg FS
+      status.textContent = 'Converting to MP4...';
       ffmpeg.FS('writeFile', 'in.webm', await fetchFile(webmBlob));
-
-      // Transcode to H.264 MP4 (yuv420p for widest compatibility)
+      
       await ffmpeg.run(
         '-i', 'in.webm',
         '-c:v', 'libx264',
@@ -122,20 +146,24 @@
         'out.mp4'
       );
 
-      // Read the MP4 and trigger download
       const mp4Data = ffmpeg.FS('readFile', 'out.mp4');
       const mp4Blob = new Blob([mp4Data.buffer], { type: 'video/mp4' });
       const url = URL.createObjectURL(mp4Blob);
-      const a   = document.createElement('a');
-      a.href    = url;
-      a.download= 'background_removed.mp4';
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = 'background_removed.mp4';
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
 
       startRecBtn.disabled = false;
+      isProcessing = false;
+      status.textContent = 'Download complete! Ready for next recording.';
     });
+
+    // Start loading model immediately
+    loadModel();
   </script>
 </body>
 </html>
