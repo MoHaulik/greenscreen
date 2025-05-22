@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>Background Remover → MP4 Export</title>
+  <style>
+    body { font-family: sans-serif; text-align:center; margin:20px }
+    #outputCanvas { margin-top:20px; width:80%; max-width:640px; background:#000 }
+    #controls button { margin:0 5px }
+  </style>
+</head>
+<body>
+  <h1>Video Background Remover → MP4</h1>
+  <input type="file" id="videoInput" accept="video/*" />
+  <video id="inputVideo" style="display:none" muted playsinline></video>
+  <canvas id="outputCanvas"></canvas>
+  <div id="controls">
+    <button id="startRec" disabled>Start Recording</button>
+    <button id="stopRec" disabled>Stop & Convert to MP4</button>
+  </div>
+
+  <!-- TF.js & BodyPix -->
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.8.0/dist/tf.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/body-pix@2.2.0/dist/body-pix.min.js"></script>
+  <!-- ffmpeg.wasm -->
+  <script type="module">
+    import { createFFmpeg, fetchFile } from 'https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.6/dist/esm/index.js';
+
+    // --- Set up BodyPix for segmentation ---
+    const netPromise = bodyPix.load({
+      architecture: 'MobileNetV1',
+      outputStride: 16,
+      multiplier: 0.75,
+      quantBytes: 2
+    });
+
+    // --- Set up ffmpeg.wasm ---
+    const ffmpeg = createFFmpeg({ log: true });
+
+    // --- DOM refs ---
+    const videoInput   = document.getElementById('videoInput');
+    const inputVideo   = document.getElementById('inputVideo');
+    const canvas       = document.getElementById('outputCanvas');
+    const ctx          = canvas.getContext('2d');
+    const startRecBtn  = document.getElementById('startRec');
+    const stopRecBtn   = document.getElementById('stopRec');
+
+    let recorder, recordedChunks;
+
+    // 1) Load BodyPix
+    let bodyPixNet;
+    netPromise.then(net => bodyPixNet = net);
+
+    // 2) When user picks file, set up video + canvas
+    videoInput.addEventListener('change', e => {
+      const file = e.target.files[0];
+      if (!file) return;
+      inputVideo.src = URL.createObjectURL(file);
+      inputVideo.load();
+      inputVideo.onloadeddata = () => {
+        canvas.width  = inputVideo.videoWidth;
+        canvas.height = inputVideo.videoHeight;
+        startSegmentationLoop();
+        startRecBtn.disabled = false;
+      };
+    });
+
+    // 3) Segmentation loop (same as before)
+    function startSegmentationLoop() {
+      inputVideo.play();
+      (async function frame() {
+        const seg = await bodyPixNet.segmentPerson(inputVideo, {
+          internalResolution: 'medium',
+          segmentationThreshold: 0.7
+        });
+        const mask = bodyPix.toMask(seg);
+        ctx.putImageData(mask, 0, 0);
+        ctx.globalCompositeOperation = 'source-in';
+        ctx.drawImage(inputVideo, 0, 0, canvas.width, canvas.height);
+        ctx.globalCompositeOperation = 'source-over';
+        requestAnimationFrame(frame);
+      })();
+    }
+
+    // 4) Recording setup
+    startRecBtn.addEventListener('click', () => {
+      recordedChunks = [];
+      const stream = canvas.captureStream(30);
+      recorder = new MediaRecorder(stream, { mimeType: 'video/webm; codecs=vp9' });
+      recorder.ondataavailable = e => {
+        if (e.data.size) recordedChunks.push(e.data);
+      };
+      recorder.start();
+      startRecBtn.disabled = true;
+      stopRecBtn.disabled  = false;
+    });
+
+    // 5) On stop: convert WebM → MP4
+    stopRecBtn.addEventListener('click', async () => {
+      recorder.stop();
+      stopRecBtn.disabled = true;
+
+      // wait for final chunk
+      await new Promise(res => recorder.onstop = res);
+      const webmBlob = new Blob(recordedChunks, { type: 'video/webm' });
+
+      // Load ffmpeg if not already
+      if (!ffmpeg.isLoaded()) {
+        await ffmpeg.load();
+      }
+
+      // Write WebM into FFmpeg FS
+      ffmpeg.FS('writeFile', 'in.webm', await fetchFile(webmBlob));
+
+      // Transcode to H.264 MP4 (yuv420p for widest compatibility)
+      await ffmpeg.run(
+        '-i', 'in.webm',
+        '-c:v', 'libx264',
+        '-pix_fmt', 'yuv420p',
+        '-movflags', 'faststart',
+        'out.mp4'
+      );
+
+      // Read the MP4 and trigger download
+      const mp4Data = ffmpeg.FS('readFile', 'out.mp4');
+      const mp4Blob = new Blob([mp4Data.buffer], { type: 'video/mp4' });
+      const url = URL.createObjectURL(mp4Blob);
+      const a   = document.createElement('a');
+      a.href    = url;
+      a.download= 'background_removed.mp4';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      startRecBtn.disabled = false;
+    });
+  </script>
+</body>
+</html>
